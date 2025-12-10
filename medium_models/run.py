@@ -96,6 +96,7 @@ class ModelArguments:
     )
 
 
+
 @dataclass
 class DynamicDataTrainingArguments(DataTrainingArguments):
     """
@@ -527,6 +528,11 @@ class DynamicTrainingArguments(TrainingArguments):
     head_tuning: bool = field(
         default=False,
         metadata={"help": "Tune the head only"}
+    )
+
+    use_sinq: bool = field(
+        default=False,
+        metadata={"help": "Use sinq"}
     )
 
 

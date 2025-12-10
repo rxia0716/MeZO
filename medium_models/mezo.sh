@@ -11,6 +11,8 @@ STEP=${STEP:-100000}
 EVAL_STEP=${EVAL_STEP:-10000}
 MODEL=${MODEL:-roberta-large}
 
+USE_SINQ=${USE_SINQ:-false}
+
 LOGITS=$(jq -n '{"SNLI": 3, "MNLI": 3, "trec": 6, "sst-5": 5}["'$TASK'"] // 2')
 
 echo "TASK: $TASK"
@@ -21,6 +23,12 @@ echo "LR: $LR"
 echo "EPS: $EPS"
 echo "Step: $STEP; Eval step: $EVAL_STEP"
 
+if [ "$USE_SINQ" == "true" ] || [ "$USE_SINQ" == "1" ]; then
+    SINQ_ARG="--use_sinq"
+else
+    SINQ_ARG=""
+fi
+
 GR_TAG=seed$SEED-bs$BS-lr$LR-eps$EPS-wd$WD-step$STEP-evalstep$EVAL_STEP
 EXTRA_TAG=${EXTRA_TAG:-ft}
 TAG=${TAG:-k${K}-${MODEL}-mezo-${EXTRA_TAG}}
@@ -29,5 +37,4 @@ echo "Tag: $TAG"
 
 TYPE=prompt GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED MODEL=$MODEL K=$K \
     bash run_fewshot.sh --per_device_train_batch_size $BS --learning_rate $LR --eval_steps $EVAL_STEP --weight_decay $WD --zero_order_eps $EPS \
-    --zero_order_optim --lr_scheduler_type "constant" --optimizer "sgd" --efficient_zero_order \
-    $@
+    --zero_order_optim --lr_scheduler_type "constant" --optimizer "sgd" --efficient_zero_order $SINQ_ARG \

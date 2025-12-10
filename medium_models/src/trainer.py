@@ -41,7 +41,17 @@ import math
 import time
 
 import transformers
-from transformers.file_utils import is_datasets_available, is_in_notebook, is_torch_tpu_available
+if not hasattr(transformers, "is_torch_tpu_available"):
+    transformers.is_torch_tpu_available = lambda: False
+
+try:
+    from transformers.utils import is_datasets_available, is_in_notebook
+except ImportError:
+    from transformers.file_utils import is_datasets_available, is_in_notebook
+
+def is_torch_tpu_available(tpu_cores=None):
+    return False
+
 from transformers.integrations import (
     is_comet_available,
     is_optuna_available,
@@ -49,7 +59,8 @@ from transformers.integrations import (
     is_tensorboard_available,
     is_wandb_available,
 )
-from transformers.optimization import AdamW, get_linear_schedule_with_warmup, get_scheduler
+from torch.optim import AdamW
+from transformers.optimization import get_linear_schedule_with_warmup, get_scheduler
 
 from transformers.trainer_callback import (
     DefaultFlowCallback,
@@ -76,6 +87,7 @@ _use_apex = False
 
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
+
 
 if is_in_notebook():
     from transformers.utils.notebook import NotebookProgressCallback
@@ -131,6 +143,24 @@ if is_ray_available():
 logger = logging.get_logger(__name__)
 logger.setLevel(logging.INFO)
 
+@torch.jit.script
+def _sinkhorn_loop(W: torch.Tensor, n_iter: int, epsilon: float):
+    rows, cols = W.shape
+    S = torch.ones(rows, 1, device=W.device, dtype=W.dtype)
+    T = torch.ones(1, cols, device=W.device, dtype=W.dtype)
+
+    for _ in range(n_iter):
+        # 保持原有逻辑，但在 JIT 内部运行更快
+        # unbiased=False 对应 numpy/torch 默认行为差异，这里显式计算更利于 JIT
+        row_std = torch.std(W, dim=1, keepdim=True, unbiased=False).clamp(min=epsilon)
+        W = W / row_std
+        S = S * row_std
+        
+        col_std = torch.std(W, dim=0, keepdim=True, unbiased=False).clamp(min=epsilon)
+        W = W / col_std
+        T = T * col_std
+    
+    return S, T
 ########## The above part is copied from Transformers' trainer (3.4.0) ##########
 
 def default_dev_objective(metrics):
@@ -156,6 +186,136 @@ class Trainer(LinearHeadTrainer):
     """
     Adding some functions based on Transformers' Trainer class.
     """
+
+    # ==============================
+    # SINQ Helper Functions (NEW)
+    # ==============================
+
+
+    def get_sinkhorn_scales(self, param, n_iter=1, epsilon=1e-6):
+        if param.dim() < 2: return None, None
+        W = param.detach().float()
+        rows, cols = W.shape
+        if rows == 1 or cols == 1: return None, None
+        
+        # 调用 JIT 编译的函数
+        S, T = _sinkhorn_loop(W, n_iter, epsilon)
+        # === 核心修改：阻尼 (Damping) ===
+        # 将 Scale 的极端值压平。
+        # 解释：如果 S 是 100，开根号后变成 10。如果 S 是 0.01，变成 0.1。
+        # 这样保留了方向性，但减弱了幅度差异。
+
+        S = S.pow(0.5) 
+        T = T.pow(0.5)
+
+        # === 核心修改：截断 (Clipping) ===
+        # 强制限制缩放因子的范围，防止个别参数扰动过大
+        S = torch.clamp(S, min=0.1, max=10.0)
+        T = torch.clamp(T, min=0.1, max=10.0)
+        
+        return S, T
+
+    def apply_sinq_noise(self, z, name, param):
+        update_interval = 10
+        if not hasattr(self, '_sinq_cache'): self._sinq_cache = {}
+        
+        cache_key = name
+        should_update = (self.state.global_step % update_interval == 0) or (cache_key not in self._sinq_cache)
+        
+        if should_update:
+            S, T = self.get_sinkhorn_scales(param)
+            self._sinq_cache[cache_key] = (S, T)
+        else:
+            S, T = self._sinq_cache[cache_key]
+
+        if S is None or T is None: return z
+
+        S = S.to(z.dtype)
+        T = T.to(z.dtype)
+        
+        # 1. 原始扰动方向
+        alpha = 0.5  # 这是一个超参数，建议 0.4 - 0.7
+        # 这种写法既保留了方向性，又保证了 S_eff 永远不会接近 0
+        S_eff = (1 - alpha) + alpha * S 
+        T_eff = (1 - alpha) + alpha * T
+        
+        z_shaped = z * S_eff * T_eff
+        
+        # === 3. 行级范数对齐 (Row-wise Norm Alignment) ===
+        # 这是“终极优化”的关键。
+        # 我们不看整个矩阵，而是保证每一行（每个输出神经元）的扰动能量不变。
+        
+        # 计算原始噪声每一行的范数 (shape: [rows, 1])
+        # keepdim=True 很重要，方便广播
+        row_norm_orig = torch.norm(z, p=2, dim=1, keepdim=True) + 1e-6
+        
+        # 计算变形后噪声每一行的范数
+        row_norm_shaped = torch.norm(z_shaped, p=2, dim=1, keepdim=True) + 1e-6
+        
+        # 计算每一行的独立缩放系数
+        row_scale = row_norm_orig / row_norm_shaped
+        
+        # 应用缩放
+        z_final = z_shaped * row_scale
+        
+        return z_final
+    
+    def apply_low_rank_sinq_noise(self, name, param, seed, scaling_factor=1.0):
+        # 1. 动态计算 Sinkhorn 因子 (和之前一样，不存梯度，只用权重)
+        # 注意：这里我们只计算 S (行因子) 和 T (列因子)
+        # 为了极度节省显存，我们甚至不需要生成完整的 S, T 矩阵，只需要向量
+        
+        if param.dim() < 2:
+            torch.manual_seed(seed)
+            # 对 1维向量直接生成普通高斯噪声
+            z = torch.normal(mean=0, std=1, size=param.size(), device=param.device, dtype=param.dtype)
+            return z
+
+        rows, cols = param.shape
+        if rows == 1 or cols == 1: 
+            # 向量参数（如 Bias），无法做低秩分解，回退到普通高斯
+            torch.manual_seed(seed)
+            z = torch.normal(mean=0, std=1, size=param.size(), device=param.device, dtype=param.dtype)
+            return z
+
+        # === 核心逻辑：生成低秩向量 u, v ===
+        torch.manual_seed(seed)
+        u = torch.normal(mean=0, std=1, size=(rows, 1), device=param.device, dtype=param.dtype)
+        
+        torch.manual_seed(seed + 1) # 不同的种子生成 v
+        v = torch.normal(mean=0, std=1, size=(1, cols), device=param.device, dtype=param.dtype)
+        
+        # === 核心逻辑：应用 Sinkhorn Scaling ===
+        # 我们不缓存 S, T 了，直接实时算，反正很快，省显存
+        # 简化版 Sinkhorn：直接用行/列标准差近似 (Iter=1 的 Sinkhorn)
+        # 这比完整循环快且不需要额外显存
+        with torch.no_grad():
+            W = param.detach().float()
+            # 行缩放因子 (对应 u)
+            row_std = torch.std(W, dim=1, keepdim=True).clamp(min=1e-6).to(param.dtype)
+            # 列缩放因子 (对应 v)
+            col_std = torch.std(W, dim=0, keepdim=True).clamp(min=1e-6).to(param.dtype)
+            
+            # 阻尼处理 (Damping)
+            row_scale = row_std.pow(0.5)
+            col_scale = col_std.pow(0.5)
+        
+        # 将 Scale 作用于低秩向量
+        u_scaled = u * row_scale
+        v_scaled = v * col_scale
+        
+        # === 核心逻辑：构造秩-1 扰动矩阵 ===
+        # z = u * v^T
+        # 这一步产生完整的矩阵，但它是 "结构化" 的
+        z = torch.matmul(u_scaled, v_scaled)
+        
+        # === 范数对齐 (Norm Alignment) ===
+        # 保持与全秩噪声相当的能量水平
+        expected_norm = math.sqrt(rows * cols) 
+        current_norm = torch.norm(z) + 1e-6
+        z = z * (expected_norm / current_norm)
+        
+        return z
 
     def create_optimizer_and_scheduler(self, num_training_steps: int):
         """
@@ -243,6 +403,8 @@ class Trainer(LinearHeadTrainer):
         torch.manual_seed(random_seed)
         for name, param in self.named_parameters_to_optim:
             z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            if self.args.use_sinq:
+                z = self.apply_sinq_noise(z, name, param)
             param.data = param.data + scaling_factor * z * self.args.zero_order_eps
         return model
 
@@ -453,7 +615,8 @@ class Trainer(LinearHeadTrainer):
             model = torch.nn.DataParallel(model)
 
         # Distributed training (should be after apex fp16 initialization)
-        if self.args.local_rank != -1:
+        import torch.distributed as dist
+        if self.args.local_rank != -1 and dist.is_initialized():
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
                 device_ids=[self.args.local_rank],
@@ -465,10 +628,14 @@ class Trainer(LinearHeadTrainer):
         if transformers.is_torch_tpu_available():
             total_train_batch_size = self.args.train_batch_size * xm.xrt_world_size()
         else:
+            world_size = 1
+            if self.args.local_rank != -1 and torch.distributed.is_initialized():
+                world_size = torch.distributed.get_world_size()
+                
             total_train_batch_size = (
                 self.args.train_batch_size
                 * self.args.gradient_accumulation_steps
-                * (torch.distributed.get_world_size() if self.args.local_rank != -1 else 1)
+                * world_size
             )
         logger.info("***** Running training *****")
         logger.info("  Num examples = %d", self.num_examples(train_dataloader))
@@ -512,6 +679,9 @@ class Trainer(LinearHeadTrainer):
         model.zero_grad()
         metrics = None
         for epoch in range(epochs_trained, int(num_train_epochs)):
+            if hasattr(self, '_sinq_cache'):
+                self._sinq_cache = {}
+
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
                 train_dataloader.sampler.set_epoch(epoch)
 
@@ -721,6 +891,9 @@ class Trainer(LinearHeadTrainer):
                                 z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
                             else:
                                 z = random_vector[name]
+                             # 保持与 perturb 阶段一致
+                            if self.args.use_sinq:
+                                z = self.apply_sinq_noise(z, name, param)
                             param.data = param.data - self.args.learning_rate * (projected_grad * z + self.args.weight_decay * param.data)
 
                         if (self.args.logging_steps > 0 and self.state.global_step % self.args.logging_steps == 0) or (
