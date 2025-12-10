@@ -12,6 +12,7 @@ EVAL_STEP=${EVAL_STEP:-10000}
 MODEL=${MODEL:-roberta-large}
 
 USE_SINQ=${USE_SINQ:-false}
+USE_ACTIVATION_GUIDED=${USE_ACTIVATION_GUIDED:-false}
 
 LOGITS=$(jq -n '{"SNLI": 3, "MNLI": 3, "trec": 6, "sst-5": 5}["'$TASK'"] // 2')
 
@@ -29,6 +30,12 @@ else
     SINQ_ARG=""
 fi
 
+if [ "$USE_ACTIVATION_GUIDED" == "true" ] || [ "$USE_ACTIVATION_GUIDED" == "1" ]; then
+    ACTIVATION_GUIDED_ARG="--use_activation_guided"
+else
+    ACTIVATION_GUIDED_ARG=""
+fi
+
 GR_TAG=seed$SEED-bs$BS-lr$LR-eps$EPS-wd$WD-step$STEP-evalstep$EVAL_STEP
 EXTRA_TAG=${EXTRA_TAG:-ft}
 TAG=${TAG:-k${K}-${MODEL}-mezo-${EXTRA_TAG}}
@@ -37,4 +44,4 @@ echo "Tag: $TAG"
 
 TYPE=prompt GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED MODEL=$MODEL K=$K \
     bash run_fewshot.sh --per_device_train_batch_size $BS --learning_rate $LR --eval_steps $EVAL_STEP --weight_decay $WD --zero_order_eps $EPS \
-    --zero_order_optim --lr_scheduler_type "constant" --optimizer "sgd" --efficient_zero_order $SINQ_ARG \
+    --zero_order_optim --lr_scheduler_type "constant" --optimizer "sgd" --efficient_zero_order $SINQ_ARG $ACTIVATION_GUIDED_ARG \

@@ -535,6 +535,11 @@ class DynamicTrainingArguments(TrainingArguments):
         metadata={"help": "Use sinq"}
     )
 
+    use_activation_guided: bool = field(
+        default=False,
+        metadata={"help": "Use activation guided ZO"}
+    )
+
 
 @dataclass
 class MyDataCollatorWithPadding:

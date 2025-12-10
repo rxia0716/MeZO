@@ -182,6 +182,79 @@ def default_dev_objective(metrics):
 
     raise Exception("No metric founded for {}".format(metrics))
 
+class ZO_ActivationGuided_Hook:
+    def __init__(self, layer_name, param, epsilon=1e-3):
+        self.layer_name = layer_name
+        self.weight_param = param # 引用权重参数
+        self.epsilon = epsilon
+        self.mode = "off" # off, probe_pos, probe_neg, update
+        self.z_vec = None # 缓存当前步的随机向量 (d_out,)
+        self.projected_grad_scalar = 0.0
+        self.learning_rate = 0.0
+        self.seed = 0
+
+    def hook_fn(self, module, inputs, output):
+        if self.mode == "off":
+            return output
+
+        x = inputs[0] # input shape: [batch, seq, d_in]
+        
+        # --- 阶段 1: 试探 (Probe) ---
+        # 我们不改权重，直接改输出 y，模拟权重被扰动的效果
+        if self.mode.startswith("probe"):
+            # 1. 确定随机种子，保证同一层的扰动在同一个step内一致
+            # (在此实现中，我们在外部设置好 seed，或者在这里生成并缓存)
+            if self.z_vec is None:
+                torch.manual_seed(self.seed)
+                # 生成与输出最后一维 (d_out) 相同的随机向量
+                # output shape: [batch, seq, d_out]
+                self.z_vec = torch.randn(output.shape[-1], device=output.device, dtype=output.dtype)
+
+            # 2. 计算输入的能量 norm_sq = ||x||^2
+            # x: [batch, seq, d_in] -> norm: [batch, seq, 1]
+            x_norm_sq = (x ** 2).sum(dim=-1, keepdim=True)
+
+            # 3. 施加扰动
+            # y' = y + sign * epsilon * z * ||x||^2
+            sign = 1.0 if self.mode == "probe_pos" else -1.0
+            perturbation = self.epsilon * self.z_vec * x_norm_sq
+            
+            return output + sign * perturbation
+
+        # --- 阶段 2: 更新 (Update) ---
+        # 此时我们需要 x，利用刚才计算出的梯度标量进行更新
+        elif self.mode == "update":
+            # 1. 恢复 z_vec (如果使用的是相同的 seed，理论上可以重算，但为了速度我们假设它还在缓存里)
+            # 如果为了极致省显存，可以在这里用 self.seed 重新生成 self.z_vec
+            if self.z_vec is None:
+                 torch.manual_seed(self.seed)
+                 self.z_vec = torch.randn(output.shape[-1], device=output.device, dtype=output.dtype)
+
+            # 2. 计算更新量
+            # Update Rule: W_new = W - lr * projected_grad * (z_vec @ x.T)
+            # 但这里是 Batch 数据，我们需要对 Batch 平均
+            # efficient implementation:
+            # grad_matrix = z_vec.unsqueeze(1) @ x.mean(dim=[0, 1]).unsqueeze(0)
+            
+            with torch.no_grad():
+                # 计算 x 的平均方向 (简单起见，对 batch 和 seq 维度平均)
+                x_mean = x.view(-1, x.shape[-1]).mean(dim=0) # [d_in]
+                
+                # 计算 update 矩阵: [d_out, 1] @ [1, d_in] -> [d_out, d_in]
+                update_mat = torch.outer(self.z_vec, x_mean)
+                
+                # 应用更新
+                # W = W - lr * g * update
+                self.weight_param.data -= self.learning_rate * self.projected_grad_scalar * update_mat
+            
+            # Update 阶段不需要修改 output，直接返回
+            return output
+    
+    def reset_context(self):
+        """每个 Step 结束清理缓存"""
+        self.z_vec = None
+
+
 class Trainer(LinearHeadTrainer):
     """
     Adding some functions based on Transformers' Trainer class.
@@ -558,6 +631,101 @@ class Trainer(LinearHeadTrainer):
         # print("Sample %d zs" % (noise_sample_time))
 
         return noise_sample_time
+    
+    def register_ag_hooks(self, model):
+        """
+        为所有需要优化的 Linear 层注册 Hook
+        """
+        self.ag_hooks = []
+        self.hook_handles = []
+        
+        # 遍历模型模块，找到 Linear 层
+        # 注意：这里需要根据 named_parameters_to_optim 来决定哪些层需要 Hook
+        # 这是一个简化的查找逻辑，你可以根据 args.fix_layers 等逻辑过滤
+        target_param_names = [n for n, p in self.named_parameters_to_optim]
+        
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear):
+                # 检查这个模块的 weight 是否在我们的优化列表中
+                # 这是一个模糊匹配，因为 module name 和 param name 可能不完全一致
+                # 严谨做法是建立 module -> param 的映射
+                weight_name = f"{name}.weight"
+                # 处理 DataParallel 前缀
+                if weight_name.startswith("module."): weight_name = weight_name[7:]
+                
+                # 这里简单判定：如果该层参数需要梯度(或是我们指定的ZO层)，就加钩子
+                if module.weight.requires_grad or any(tgt in weight_name for tgt in target_param_names):
+                    hook_obj = ZO_ActivationGuided_Hook(name, module.weight, epsilon=self.args.zero_order_eps)
+                    handle = module.register_forward_hook(hook_obj.hook_fn)
+                    
+                    self.ag_hooks.append(hook_obj)
+                    self.hook_handles.append(handle)
+        
+        logger.info(f"Registered Activation-Guided Hooks for {len(self.ag_hooks)} layers.")
+
+    def remove_ag_hooks(self):
+        for handle in self.hook_handles:
+            handle.remove()
+        self.ag_hooks = []
+        self.hook_handles = []
+
+    def zo_activation_guided_step(self, model, inputs, epoch_iterator):
+        """
+        执行 Activation-Guided ZO 的核心 Step：
+        1. Pass 1 (Pos): 设置 Hook 为 probe_pos, 计算 loss1
+        2. Pass 2 (Neg): 设置 Hook 为 probe_neg, 计算 loss2
+        3. 计算标量梯度
+        4. Pass 3 (Update): 设置 Hook 为 update, 重新推理并 In-place 更新权重
+        """
+        
+        # 1. 初始化 / 设置随机种子
+        current_seed = np.random.randint(1000000000)
+        for hook in self.ag_hooks:
+            hook.seed = current_seed
+            hook.z_vec = None # 清空上一轮的缓存
+        
+        # ==========================
+        # Pass 1: Positive Perturbation
+        # ==========================
+        for hook in self.ag_hooks: hook.mode = "probe_pos"
+        loss1 = self.zo_forward(model, inputs)
+        
+        # ==========================
+        # Pass 2: Negative Perturbation
+        # ==========================
+        # 只有当不需要重算 z_vec 时，这里才高效。我们复用 z_vec
+        for hook in self.ag_hooks: hook.mode = "probe_neg"
+        loss2 = self.zo_forward(model, inputs)
+        
+        # ==========================
+        # Calculate Gradient Scalar
+        # ==========================
+        projected_grad = (loss1 - loss2) / (2 * self.args.zero_order_eps)
+        
+        # 学习率调度
+        current_lr = self.lr_scheduler.get_last_lr()[0]
+        
+        # ==========================
+        # Pass 3: Re-materialization & Update
+        # ==========================
+        # 这是你 idea 的核心：再跑一次 forward，拿到 x，原地更新
+        for hook in self.ag_hooks:
+            hook.mode = "update"
+            hook.projected_grad_scalar = projected_grad
+            hook.learning_rate = current_lr
+        
+        # 跑一次前向传播 (不需要算 loss，只需要触发 Hook)
+        with torch.no_grad():
+            model(**self._prepare_inputs(inputs))
+            
+        # ==========================
+        # Cleanup
+        # ==========================
+        for hook in self.ag_hooks:
+            hook.mode = "off"
+            hook.reset_context()
+
+        return loss1
 
     def train(self, model_path=None, dev_objective=None):
         """
@@ -714,6 +882,30 @@ class Trainer(LinearHeadTrainer):
                     continue
                     
                 if self.args.zero_order_optim:
+
+                    if hasattr(self.args, 'use_activation_guided') and self.args.use_activation_guided:
+                        # 第一次运行时注册 Hook
+                        if not hasattr(self, 'ag_hooks') or len(self.ag_hooks) == 0:
+                            self.register_ag_hooks(model)
+                        
+                        # 执行你的 3-pass 更新逻辑
+                        loss1 = self.zo_activation_guided_step(model, inputs, epoch_iterator)
+                        
+                        # Logging (复用原有的 log 逻辑)
+                        if (self.args.logging_steps > 0 and self.state.global_step % self.args.logging_steps == 0):
+                            logs = {}
+                            logs["loss"] = loss1.item()
+                            logs["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
+                            logs["global_step"] = self.state.global_step
+                            logs["zo_method"] = "activation_guided_remat" # 标记一下
+                            self.log(logs)
+
+                        self.state.global_step += 1
+                        self.lr_scheduler.step() # 不要忘了 step scheduler
+                        
+                        # 跳过后面原有的 ZO 逻辑
+                        continue
+
                     # Get parameters that should be optimized (for layer-wise optimization and prefix-tuning)
                     self.named_parameters_to_optim = []
                     for name, param in model.named_parameters():
