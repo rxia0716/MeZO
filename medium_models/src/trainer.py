@@ -318,18 +318,17 @@ class Trainer(LinearHeadTrainer):
         # 这是“终极优化”的关键。
         # 我们不看整个矩阵，而是保证每一行（每个输出神经元）的扰动能量不变。
         
-        # 计算原始噪声每一行的范数 (shape: [rows, 1])
-        # keepdim=True 很重要，方便广播
-        row_norm_orig = torch.norm(z, p=2, dim=1, keepdim=True) + 1e-6
-        
-        # 计算变形后噪声每一行的范数
-        row_norm_shaped = torch.norm(z_shaped, p=2, dim=1, keepdim=True) + 1e-6
-        
-        # 计算每一行的独立缩放系数
-        row_scale = row_norm_orig / row_norm_shaped
+        global_norm_orig = torch.norm(z, p=2) + 1e-6
+
+        # 2. 计算变形后噪声的全局范数 (Scalar)
+        global_norm_shaped = torch.norm(z_shaped, p=2) + 1e-6
+
+        # 3. 计算全局唯一的缩放系数
+        # 标量除法，global_scale 也是一个标量
+        global_scale = global_norm_orig / global_norm_shaped
         
         # 应用缩放
-        z_final = z_shaped * row_scale
+        z_final = z_shaped * global_scale
         
         return z_final
     
@@ -883,6 +882,12 @@ class Trainer(LinearHeadTrainer):
                     
                 if self.args.zero_order_optim:
 
+                    # Get parameters that should be optimized (for layer-wise optimization and prefix-tuning)
+                    self.named_parameters_to_optim = []
+                    for name, param in model.named_parameters():
+                        if self.should_optim(name, param):
+                            self.named_parameters_to_optim.append((name, param))
+
                     if hasattr(self.args, 'use_activation_guided') and self.args.use_activation_guided:
                         # 第一次运行时注册 Hook
                         if not hasattr(self, 'ag_hooks') or len(self.ag_hooks) == 0:
@@ -906,11 +911,6 @@ class Trainer(LinearHeadTrainer):
                         # 跳过后面原有的 ZO 逻辑
                         continue
 
-                    # Get parameters that should be optimized (for layer-wise optimization and prefix-tuning)
-                    self.named_parameters_to_optim = []
-                    for name, param in model.named_parameters():
-                        if self.should_optim(name, param):
-                            self.named_parameters_to_optim.append((name, param))
 
                     if self.args.zo_by_layer:
                         assert not self.args.efficient_zero_order, 'did not implement preconditioned ZO for efficient ZO yet'
